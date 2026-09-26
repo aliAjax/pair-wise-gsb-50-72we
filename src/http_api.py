@@ -12,6 +12,10 @@ from .domain import Actor, DomainError, PermissionDenied, ValidationError
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+INSTALLMENTS_RE = re.compile(r"^/api/records/(\d+)/installments$")
+PLAN_REVIEW_RE = re.compile(r"^/api/records/(\d+)/installments/(\d+)/review$")
+PLAN_PAYMENTS_RE = re.compile(r"^/api/records/(\d+)/installments/(\d+)/payments$")
+CERTIFICATE_RE = re.compile(r"^/api/records/(\d+)/certificate$")
 
 
 def make_handler(service: Any, static_dir: Path):
@@ -84,6 +88,13 @@ def make_handler(service: Any, static_dir: Path):
                 if match:
                     self._send(200, {"items": service.timeline(self._actor(), int(match.group(1)))})
                     return
+                match = INSTALLMENTS_RE.match(parsed.path)
+                if match:
+                    self._send(200, service.list_installment_plans(self._actor(), int(match.group(1))))
+                    return
+                if parsed.path == "/api/dunning":
+                    self._send(200, service.list_dunning(self._actor()))
+                    return
                 if parsed.path == "/api/stats":
                     self._send(200, service.stats(self._actor()))
                     return
@@ -105,6 +116,29 @@ def make_handler(service: Any, static_dir: Path):
                     if not isinstance(version, int):
                         raise ValidationError("expected_version必须是整数")
                     record = service.act(self._actor(), int(match.group(1)), version, match.group(2), body.get("data", {}))
+                    self._send(200, record)
+                    return
+                match = INSTALLMENTS_RE.match(parsed.path)
+                if match:
+                    plan = service.apply_installment_plan(self._actor(), int(match.group(1)), body)
+                    self._send(201, plan)
+                    return
+                match = PLAN_REVIEW_RE.match(parsed.path)
+                if match:
+                    plan = service.review_installment_plan(self._actor(), int(match.group(1)), int(match.group(2)), body)
+                    self._send(200, plan)
+                    return
+                match = PLAN_PAYMENTS_RE.match(parsed.path)
+                if match:
+                    plan = service.record_installment_payment(self._actor(), int(match.group(1)), int(match.group(2)), body)
+                    self._send(201, plan)
+                    return
+                match = CERTIFICATE_RE.match(parsed.path)
+                if match:
+                    version = body.get("expected_version")
+                    if not isinstance(version, int):
+                        raise ValidationError("expected_version必须是整数")
+                    record = service.issue_closure_certificate(self._actor(), int(match.group(1)), version)
                     self._send(200, record)
                     return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})

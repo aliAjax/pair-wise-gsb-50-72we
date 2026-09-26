@@ -8,8 +8,16 @@
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #17212b; }
     main { max-width: 960px; margin: auto; }
     button { padding: .55rem .9rem; cursor: pointer; }
+    input, select { padding: .45rem .6rem; }
     pre { background: #f4f6f8; padding: 1rem; overflow: auto; border-radius: 8px; }
-    .row { display: flex; gap: 1rem; align-items: center; }
+    .row { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; margin: .5rem 0; }
+    .plan { border: 1px solid #d7dee6; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+    .plan h4 { margin: 0 0 .5rem; }
+    table { border-collapse: collapse; width: 100%; margin: .5rem 0; }
+    th, td { border: 1px solid #d7dee6; padding: .35rem .6rem; text-align: left; }
+    .overdue { color: #b3261e; font-weight: 600; }
+    .paid { color: #1a7f37; }
+    .muted { color: #667085; font-size: .9rem; }
   </style>
 </head>
 <body>
@@ -17,17 +25,161 @@
   <h1>税务稽查案件与复议流程</h1>
   <p>最小演示页。完整业务流程通过README中的JSON接口调用。</p>
   <div class="row"><button id="load">加载记录</button><button id="stats">查看状态统计</button></div>
+
+  <h2>分期缴纳（结案后）</h2>
+  <div class="row">
+    <label>案件ID <input id="caseId" type="number" min="1" value="1"></label>
+    <button id="loadPlans">查询计划/实缴/催缴</button>
+    <button id="loadDunning">全部催缴</button>
+    <button id="certify">开具结案证明</button>
+  </div>
+
+  <h3>申请分期</h3>
+  <div class="row">
+    <input id="reason" placeholder="申请理由（缴款困难说明）" size="36">
+    <label>期数
+      <select id="periods">
+        <option>2</option><option>3</option><option>4</option><option>5</option><option>6</option>
+      </select>
+    </label>
+    <button id="buildItems">生成期次</button>
+    <button id="applyPlan">提交申请</button>
+  </div>
+  <div id="itemInputs"></div>
+  <div id="plans"></div>
   <pre id="output">点击上方按钮读取服务状态。</pre>
 </main>
 <script>
 const headers = {"X-User-Id":"demo-admin","X-Role":"admin","X-Org":"demo"};
-async function show(path) {
-  const response = await fetch(path, {headers});
+const output = document.getElementById("output");
+const PLAN_STATUS = {"pending":"待复核","approved":"缴纳中","returned":"已退回","completed":"已缴清"};
+
+function show(data) { output.textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2); }
+function esc(value) { return String(value).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+async function request(path, method, body) {
+  const options = {method: method || "GET", headers: Object.assign({}, headers)};
+  if (body !== undefined) {
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(path, options);
   const data = await response.json();
-  document.getElementById("output").textContent = JSON.stringify(data, null, 2);
+  if (!response.ok) {
+    const error = new Error(data.message || "请求失败");
+    error.data = data;
+    throw error;
+  }
+  return data;
 }
-document.getElementById("load").onclick = () => show("/api/records?limit=20");
-document.getElementById("stats").onclick = () => show("/api/stats");
+
+async function run(task) {
+  try { await task(); } catch (error) { show(error.data || String(error)); }
+}
+
+function caseId() { return document.getElementById("caseId").value; }
+
+document.getElementById("load").onclick = () => run(async () => show(await request("/api/records?limit=20")));
+document.getElementById("stats").onclick = () => run(async () => show(await request("/api/stats")));
+
+document.getElementById("buildItems").onclick = () => {
+  const count = parseInt(document.getElementById("periods").value, 10);
+  const box = document.getElementById("itemInputs");
+  box.innerHTML = "";
+  for (let seq = 1; seq <= count; seq++) {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML = `<span>第${seq}期</span><input type="date" id="item-date-${seq}"><input type="number" min="0" step="0.01" placeholder="金额" id="item-amount-${seq}">`;
+    box.appendChild(row);
+  }
+};
+
+document.getElementById("applyPlan").onclick = () => run(async () => {
+  const count = parseInt(document.getElementById("periods").value, 10);
+  const items = [];
+  for (let seq = 1; seq <= count; seq++) {
+    const dateInput = document.getElementById(`item-date-${seq}`);
+    const amountInput = document.getElementById(`item-amount-${seq}`);
+    if (!dateInput || !amountInput) { show("请先点击“生成期次”填写每期日期和金额"); return; }
+    items.push({date: dateInput.value, amount: parseFloat(amountInput.value)});
+  }
+  const plan = await request(`/api/records/${caseId()}/installments`, "POST", {reason: document.getElementById("reason").value, items});
+  show(plan);
+  await loadPlans();
+});
+
+function actionButton(label, task) {
+  const button = document.createElement("button");
+  button.textContent = label;
+  button.onclick = () => run(task);
+  return button;
+}
+
+function renderPlans(data) {
+  const box = document.getElementById("plans");
+  box.innerHTML = `<p>应缴总额 ${data.total_due}，未缴金额 <b>${data.unpaid_amount}</b>，计划数 ${data.items.length}</p>`;
+  for (const plan of data.items) {
+    const div = document.createElement("div");
+    div.className = "plan";
+    const rows = plan.items.map(item => {
+      const cls = item.status === "overdue" ? "overdue" : (item.status === "paid" ? "paid" : "");
+      const label = item.status === "overdue" ? `催缴（逾期${item.days_overdue}天）` : (item.status === "paid" ? "已缴清" : "待缴");
+      return `<tr><td>第${item.seq}期</td><td>${item.due_date}</td><td>${item.amount}</td><td>${item.paid_amount}</td><td>${item.remaining}</td><td class="${cls}">${label}</td></tr>`;
+    }).join("");
+    const payments = plan.payments.map(p => `<li>第${p.seq}期实缴 ${p.amount}，缴款日 ${p.paid_on}，登记人 ${esc(p.recorded_by)}</li>`).join("");
+    const review = plan.reviewed_by ? `；复核人 ${esc(plan.reviewed_by)}（${esc(plan.review_note || "无意见")}）` : "";
+    div.innerHTML = `
+      <h4>计划 #${plan.id} — ${PLAN_STATUS[plan.status] || plan.status}</h4>
+      <p class="muted">理由：${esc(plan.reason)}；总额 ${plan.total_amount}；已缴 ${plan.paid_total}；申请人 ${esc(plan.created_by)}${review}</p>
+      <table><tr><th>期次</th><th>应缴日期</th><th>应缴金额</th><th>已缴</th><th>剩余</th><th>状态</th></tr>${rows}</table>
+      ${payments ? `<p class="muted">实缴记录：</p><ul>${payments}</ul>` : ""}
+      <div class="row"></div>`;
+    const actions = div.querySelector(".row");
+    if (plan.status === "pending") {
+      actions.appendChild(actionButton("批准", async () => { await reviewPlan(plan.id, "approved"); }));
+      actions.appendChild(actionButton("退回", async () => { await reviewPlan(plan.id, "returned"); }));
+    }
+    if (plan.status === "approved") {
+      actions.appendChild(actionButton("登记实缴", async () => { await recordPayment(plan.id); }));
+    }
+    box.appendChild(div);
+  }
+}
+
+async function loadPlans() {
+  const data = await request(`/api/records/${caseId()}/installments`);
+  renderPlans(data);
+  show(data);
+}
+
+async function reviewPlan(planId, outcome) {
+  const note = window.prompt(outcome === "returned" ? "退回原因（必填）" : "复核意见（可空）", "");
+  if (note === null) return;
+  const plan = await request(`/api/records/${caseId()}/installments/${planId}/review`, "POST", {outcome, note});
+  show(plan);
+  await loadPlans();
+}
+
+async function recordPayment(planId) {
+  const seq = window.prompt("期次序号", "1");
+  if (seq === null) return;
+  const amount = window.prompt("实缴金额", "");
+  if (amount === null) return;
+  const paidOn = window.prompt("缴款日期（YYYY-MM-DD，留空为今日）", "");
+  if (paidOn === null) return;
+  const body = {seq: parseInt(seq, 10), amount: parseFloat(amount)};
+  if (paidOn.trim()) body.paid_on = paidOn.trim();
+  const plan = await request(`/api/records/${caseId()}/installments/${planId}/payments`, "POST", body);
+  show(plan);
+  await loadPlans();
+}
+
+document.getElementById("loadPlans").onclick = () => run(loadPlans);
+document.getElementById("loadDunning").onclick = () => run(async () => show(await request("/api/dunning")));
+document.getElementById("certify").onclick = () => run(async () => {
+  const record = await request(`/api/records/${caseId()}`);
+  show(await request(`/api/records/${caseId()}/certificate`, "POST", {expected_version: record.version}));
+});
 </script>
 </body>
 </html>
