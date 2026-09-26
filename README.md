@@ -7,7 +7,8 @@
 - `app.py`：命令行参数、依赖组装和服务启动。
 - `src/domain.py`：领域数据类型、错误和基础校验。
 - `src/rules.py`：状态转换、补税、滞纳金、处罚和证据完整性和冲突检查。
-- `src/repository.py`：SQLite建表、事务和查询。
+- `src/installments.py`：结案后分期缴纳规则（2到6期、首期15天内、间隔30天内、总额等于未缴金额、催缴计算）。
+- `src/repository.py`：SQLite建表、事务和查询（含分期计划与实缴表）。
 - `src/service.py`：用例编排、权限检查、乐观并发和审计。
 - `src/http_api.py`：HTTP路由与统一错误响应。
 - `src/audit.py`：事件时间线。
@@ -32,6 +33,11 @@ python3 app.py --db ./data.db --port 8326
 - `GET /api/stats`：状态统计。
 - `POST /api/records`：创建记录，请求体为`{"reference":"...","data":{...}}`。
 - `POST /api/records/{id}/actions/{action}`：执行业务动作，请求体为`{"expected_version":1,"data":{...}}`。
+- `POST /api/records/{id}/installments`：结案后申请分期缴纳（纳税人代表），请求体为`{"installments":[{"due_date":"YYYY-MM-DD","amount":...},...]}`。
+- `POST /api/records/{id}/installments/{plan}/review`：复核分期申请（复核人员），请求体为`{"decision":"approve|return","note":"..."}`。
+- `POST /api/records/{id}/installments/{plan}/payments`：登记某期实缴（复核人员），请求体为`{"seq":1,"amount":...,"paid_date":"YYYY-MM-DD"}`。
+- `GET /api/records/{id}/installments`：分期计划总览，含每期状态、实缴明细和逾期催缴。
+- `GET /api/records/{id}/closure-certificate`：开具结案证明，缴清前返回409。
 
 除`/health`和`/`外，请求需提供`X-User-Id`、`X-Role`，可选`X-Org`。
 

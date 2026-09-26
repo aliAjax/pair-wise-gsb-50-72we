@@ -47,8 +47,32 @@ class Repository:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS installment_plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    total_amount REAL NOT NULL,
+                    installments TEXT NOT NULL,
+                    applied_by TEXT NOT NULL,
+                    applied_at TEXT NOT NULL,
+                    decided_by TEXT NOT NULL DEFAULT '',
+                    decided_at TEXT NOT NULL DEFAULT '',
+                    decision_note TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS installment_payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plan_id INTEGER NOT NULL REFERENCES installment_plans(id) ON DELETE CASCADE,
+                    seq INTEGER NOT NULL,
+                    amount REAL NOT NULL,
+                    paid_date TEXT NOT NULL,
+                    registered_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_records_state ON records(state);
                 CREATE INDEX IF NOT EXISTS idx_audit_record ON audit_events(record_id, id);
+                CREATE INDEX IF NOT EXISTS idx_plans_record ON installment_plans(record_id, id);
+                CREATE INDEX IF NOT EXISTS idx_payments_plan ON installment_payments(plan_id, id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_plans_pending ON installment_plans(record_id) WHERE status='pending';
                 """
             )
 
@@ -141,6 +165,75 @@ class Repository:
         with self._connect() as connection:
             rows = connection.execute("SELECT state, COUNT(*) AS total FROM records GROUP BY state").fetchall()
         return {str(row["state"]): int(row["total"]) for row in rows}
+
+    @staticmethod
+    def _plan_row(row: sqlite3.Row, payments: List[sqlite3.Row]) -> Dict[str, Any]:
+        item = dict(row)
+        item["installments"] = json.loads(item["installments"])
+        item["payments"] = [dict(payment) for payment in payments]
+        return item
+
+    def create_plan(self, record_id: int, schedule: List[Dict[str, Any]], actor_id: str) -> Dict[str, Any]:
+        now = _now()
+        total = round(sum(float(item["amount"]) for item in schedule), 2)
+        try:
+            with self._connect() as connection:
+                cursor = connection.execute(
+                    "INSERT INTO installment_plans(record_id,status,total_amount,installments,applied_by,applied_at) VALUES(?,?,?,?,?,?)",
+                    (record_id, "pending", total, json.dumps(schedule, ensure_ascii=False, sort_keys=True), actor_id, now),
+                )
+                plan_id = int(cursor.lastrowid)
+                row = connection.execute("SELECT * FROM installment_plans WHERE id=?", (plan_id,)).fetchone()
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("已有待复核的分期申请") from exc
+        return self._plan_row(row, [])
+
+    def get_plan(self, record_id: int, plan_id: int) -> Dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM installment_plans WHERE id=? AND record_id=?", (plan_id, record_id)).fetchone()
+            if row is None:
+                raise NotFound("分期计划不存在")
+            payments = connection.execute("SELECT * FROM installment_payments WHERE plan_id=? ORDER BY id", (plan_id,)).fetchall()
+        return self._plan_row(row, payments)
+
+    def latest_plan(self, record_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM installment_plans WHERE record_id=? ORDER BY id DESC LIMIT 1", (record_id,)).fetchone()
+            if row is None:
+                return None
+            payments = connection.execute("SELECT * FROM installment_payments WHERE plan_id=? ORDER BY id", (row["id"],)).fetchall()
+        return self._plan_row(row, payments)
+
+    def update_plan_status(self, plan_id: int, status: str, actor_id: str, note: str) -> Dict[str, Any]:
+        now = _now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE installment_plans SET status=?,decided_by=?,decided_at=?,decision_note=? WHERE id=?",
+                (status, actor_id, now, note, plan_id),
+            )
+            if cursor.rowcount == 0:
+                raise NotFound("分期计划不存在")
+            row = connection.execute("SELECT * FROM installment_plans WHERE id=?", (plan_id,)).fetchone()
+            payments = connection.execute("SELECT * FROM installment_payments WHERE plan_id=? ORDER BY id", (plan_id,)).fetchall()
+        return self._plan_row(row, payments)
+
+    def add_payment(self, plan_id: int, seq: int, amount: float, paid_date: str, actor_id: str) -> Dict[str, Any]:
+        now = _now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO installment_payments(plan_id,seq,amount,paid_date,registered_by,created_at) VALUES(?,?,?,?,?,?)",
+                (plan_id, seq, amount, paid_date, actor_id, now),
+            )
+            row = connection.execute("SELECT * FROM installment_payments WHERE id=?", (int(cursor.lastrowid),)).fetchone()
+        return dict(row)
+
+    def paid_total(self, record_id: int) -> float:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(SUM(p.amount),0) AS total FROM installment_payments p JOIN installment_plans pl ON pl.id=p.plan_id WHERE pl.record_id=?",
+                (record_id,),
+            ).fetchone()
+        return round(float(row["total"]), 2)
 
     def health(self) -> bool:
         try:
